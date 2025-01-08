@@ -1,225 +1,112 @@
-#include <windows.h>
-#include <iostream>
-#include <vector>
-#include <string>
+п»ї#include "Bitmap.h"
+#include <algorithm>
+#include <ctime>
 #include <fstream>
-#include <chrono>
-#include <tuple>  // Для std::make_tuple
-#include <cmath>  // Для std::sqrt()
+#include <iostream>
+#include <string>
+#define _USE_MATH_DEFINES
+#include <math.h>
 
-// Структура для хранения BMP-заголовков
-#pragma pack(push, 1)
-struct BMPHeader {
-    uint16_t bfType;
-    uint32_t bfSize;
-    uint16_t bfReserved1;
-    uint16_t bfReserved2;
-    uint32_t bfOffBits;
+struct Params
+{
+    Bitmap* in;
+    uint32_t startHeight;
+    uint32_t endHeight;
+    uint32_t startWidth;
+    uint32_t endWidth;
 };
 
-struct DIBHeader {
-    uint32_t biSize;
-    int32_t biWidth;
-    int32_t biHeight;
-    uint16_t biPlanes;
-    uint16_t biBitCount;
-    uint32_t biCompression;
-    uint32_t biSizeImage;
-    int32_t biXPelsPerMeter;
-    int32_t biYPelsPerMeter;
-    uint32_t biClrUsed;
-    uint32_t biClrImportant;
-};
-#pragma pack(pop)
+void Blur(int radius, Params* params)
+{
+    float rs = ceil(radius * 3);
+    float sigma = radius / 2.0;
+    float twoPiSigmaSquare = 2.0 * M_PI * sigma * sigma;
+    for (auto i = params->startHeight; i < params->endHeight; ++i)
+    {
+        for (auto j = params->startWidth; j < params->endWidth; ++j)
+        {
+            double r = 0, g = 0, b = 0;
+            double weightSum = 0;
 
-// Структура для хранения пикселей RGB
-struct RGB {
-    uint8_t blue;
-    uint8_t green;
-    uint8_t red;
-};
+            for (int iy = i - rs; iy < i + rs + 1; ++iy)
+            {
+                for (int ix = j - rs; ix < j + rs + 1; ++ix)
+                {
+                    auto x = min(static_cast<int>(params->endWidth) - 1, max(0, ix));
+                    auto y = min(static_cast<int>(params->endHeight) - 1, max(0, iy));
 
-// Функция для применения фильтра размытия (например, 3x3 гауссов фильтр)
-void applyBlurFilter(std::vector<std::vector<RGB>>& pixels, int startX, int startY, int endX, int endY, int width, int height) {
-    int kernel[3][3] = {
-        {1, 2, 1},
-        {2, 4, 2},
-        {1, 2, 1}
-    };
-    int kernelSum = 16;  // Сумма ядра
+                    float distanceSquare = ((ix - j) * (ix - j)) + ((iy - i) * (iy - i));
+                    float weight = exp(-distanceSquare / (2.0 * sigma * sigma)) / twoPiSigmaSquare;
 
-    std::vector<std::vector<RGB>> tempPixels = pixels;  // Для сохранения изменений
+                    rgb32* pixel = params->in->GetPixel(x, y);
 
-    for (int y = startY; y < endY && y < height; ++y) {
-        for (int x = startX; x < endX && x < width; ++x) {
-            if (x > 0 && x < width - 1 && y > 0 && y < height - 1) {
-                int redSum = 0, greenSum = 0, blueSum = 0;
-                for (int ky = -1; ky <= 1; ++ky) {
-                    for (int kx = -1; kx <= 1; ++kx) {
-                        int px = x + kx;
-                        int py = y + ky;
-
-                        redSum += pixels[py][px].red * kernel[ky + 1][kx + 1];
-                        greenSum += pixels[py][px].green * kernel[ky + 1][kx + 1];
-                        blueSum += pixels[py][px].blue * kernel[ky + 1][kx + 1];
-                    }
+                    r += pixel->r * weight;
+                    g += pixel->g * weight;
+                    b += pixel->b * weight;
+                    weightSum += weight;
                 }
-                tempPixels[y][x].red = redSum / kernelSum;
-                tempPixels[y][x].green = greenSum / kernelSum;
-                tempPixels[y][x].blue = blueSum / kernelSum;
             }
-        }
-    }
 
-    // Копируем результаты обратно в оригинальный массив
-    for (int y = startY; y < endY && y < height; ++y) {
-        for (int x = startX; x < endX && x < width; ++x) {
-            pixels[y][x] = tempPixels[y][x];
+            rgb32* pixel = params->in->GetPixel(j, i);
+            pixel->r = std::round(r / weightSum);
+            pixel->g = std::round(g / weightSum);
+            pixel->b = std::round(b / weightSum);
         }
     }
 }
 
-// Функция для обработки квадрата в потоке
-DWORD WINAPI ThreadProc(LPVOID lpParam) {
-    auto params = reinterpret_cast<std::tuple<std::vector<std::vector<RGB>>*, int, int, int, int, int, int>*>(lpParam);
-    auto pixels = std::get<0>(*params);
-    int startX = std::get<1>(*params);
-    int startY = std::get<2>(*params);
-    int endX = std::get<3>(*params);
-    int endY = std::get<4>(*params);
-    int width = std::get<5>(*params);
-    int height = std::get<6>(*params);
-
-    applyBlurFilter(*pixels, startX, startY, endX, endY, width, height);
+DWORD WINAPI StartThreads(CONST LPVOID lpParam)
+{
+    struct Params* params = (struct Params*)lpParam;
+    Blur(10, params);
     ExitThread(0);
 }
 
-// Функция для чтения BMP-файла
-bool readBMP(const std::string& filename, BMPHeader& bmpHeader, DIBHeader& dibHeader, std::vector<std::vector<RGB>>& pixels) {
-    std::ifstream file(filename, std::ios::binary);
-    if (!file) {
-        std::cerr << "Error: Cannot open file " << filename << std::endl;
-        return false;
+void StartThreads(Bitmap* in, int threadsCount, int coreCount)
+{
+    int partHeight = in->GetHeight() / threadsCount;
+    int heightRemaining = in->GetHeight() % threadsCount;
+
+    Params* arrayParams = new Params[threadsCount];
+    for (int i = 0; i < threadsCount; i++)
+    {
+        Params params;
+        params.in = in;
+        params.startWidth = 0;
+        params.endWidth = in->GetWidth();
+        params.startHeight = partHeight * i;
+        params.endHeight = partHeight * (i + 1) + ((i == threadsCount - 1) ? heightRemaining : 0);
+        arrayParams[i] = params;
     }
 
-    // Чтение заголовков
-    file.read(reinterpret_cast<char*>(&bmpHeader), sizeof(BMPHeader));
-    file.read(reinterpret_cast<char*>(&dibHeader), sizeof(DIBHeader));
-
-    if (bmpHeader.bfType != 0x4D42) {
-        std::cerr << "Error: Not a valid BMP file" << std::endl;
-        return false;
+    HANDLE* handles = new HANDLE[threadsCount];
+    for (int i = 0; i < threadsCount; i++)
+    {
+        handles[i] = CreateThread(NULL, i, &StartThreads, &arrayParams[i], CREATE_SUSPENDED, NULL);
+        SetThreadAffinityMask(handles[i], (1 << coreCount) - 1);
     }
 
-    // Чтение пикселей
-    pixels.resize(dibHeader.biHeight, std::vector<RGB>(dibHeader.biWidth));
-    file.seekg(bmpHeader.bfOffBits, file.beg);
-
-    for (int y = 0; y < dibHeader.biHeight; ++y) {
-        file.read(reinterpret_cast<char*>(pixels[y].data()), dibHeader.biWidth * sizeof(RGB));
+    for (int i = 0; i < threadsCount; i++)
+    {
+        ResumeThread(handles[i]);
     }
 
-    file.close();
-    return true;
+
+    WaitForMultipleObjects(threadsCount, handles, true, INFINITE);
+
+    delete[] arrayParams;
+    delete[] handles;
 }
 
-// Функция для записи BMP-файла
-bool writeBMP(const std::string& filename, const BMPHeader& bmpHeader, const DIBHeader& dibHeader, const std::vector<std::vector<RGB>>& pixels) {
-    std::ofstream file(filename, std::ios::binary);
-    if (!file) {
-        std::cerr << "Error: Cannot open file " << filename << std::endl;
-        return false;
-    }
+int main(int argc, const char** argv)
+{
+    double start = clock();
 
-    // Запись заголовков
-    file.write(reinterpret_cast<const char*>(&bmpHeader), sizeof(BMPHeader));
-    file.write(reinterpret_cast<const char*>(&dibHeader), sizeof(DIBHeader));
+    Bitmap bmp{ "formula.bmp" };
+    StartThreads(&bmp, 16, 4);
+    bmp.Save("bluredImage.bmp");
 
-    // Запись пикселей
-    for (int y = 0; y < dibHeader.biHeight; ++y) {
-        file.write(reinterpret_cast<const char*>(pixels[y].data()), dibHeader.biWidth * sizeof(RGB));
-    }
-
-    file.close();
-    return true;
-}
-
-int main(int argc, char* argv[]) {
-    if (argc < 5) {
-        std::cerr << "Usage: " << argv[0] << " <input_file> <output_file> <threads> <cores>" << std::endl;
-        return 1;
-    }
-
-    std::string inputFile = argv[1];
-    std::string outputFile = argv[2];
-    int numThreads = std::stoi(argv[3]);
-    int numCores = std::stoi(argv[4]);
-
-    BMPHeader bmpHeader;
-    DIBHeader dibHeader;
-    std::vector<std::vector<RGB>> pixels;
-
-    // Чтение входного BMP файла
-    if (!readBMP(inputFile, bmpHeader, dibHeader, pixels)) {
-        return 1;
-    }
-
-    int width = dibHeader.biWidth;
-    int height = dibHeader.biHeight;
-
-    // Установка маски процессоров (SetThreadAffinityMask)
-    DWORD_PTR affinityMask = (1 << numCores) - 1;
-
-    // Время начала выполнения
-    auto start = std::chrono::high_resolution_clock::now();
-
-    // Создание потоков для обработки
-    HANDLE* threads = new HANDLE[numThreads];
-    std::tuple<std::vector<std::vector<RGB>>*, int, int, int, int, int, int>* params = new std::tuple<std::vector<std::vector<RGB>>*, int, int, int, int, int, int>[numThreads];
-
-    // Разбиение на квадраты
-    int sqrtThreads = static_cast<int>(std::sqrt(numThreads));
-    int squareWidth = width / sqrtThreads;
-    int squareHeight = height / sqrtThreads;
-
-    int threadIndex = 0;
-    for (int i = 0; i < sqrtThreads; ++i) {
-        for (int j = 0; j < sqrtThreads; ++j) {
-            int startX = j * squareWidth;
-            int startY = i * squareHeight;
-            int endX = (j + 1) * squareWidth;
-            int endY = (i + 1) * squareHeight;
-
-            params[threadIndex] = std::make_tuple(&pixels, startX, startY, endX, endY, width, height);
-
-            threads[threadIndex] = CreateThread(NULL, 0, ThreadProc, &params[threadIndex], 0, NULL);
-            SetThreadAffinityMask(threads[threadIndex], affinityMask);
-
-            ++threadIndex;
-        }
-    }
-
-    // Ожидание завершения всех потоков
-    WaitForMultipleObjects(numThreads, threads, TRUE, INFINITE);
-
-    // Время окончания выполнения
-    auto end = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double, std::milli> elapsed = end - start;
-
-    // Запись выходного BMP файла
-    if (!writeBMP(outputFile, bmpHeader, dibHeader, pixels)) {
-        return 1;
-    }
-
-    // Освобождение ресурсов
-    for (int i = 0; i < numThreads; ++i) {
-        CloseHandle(threads[i]);
-    }
-    delete[] threads;
-    delete[] params;
-
-    // Вывод времени выполнения
-    std::cout << "Time taken: " << elapsed.count() << " ms" << std::endl;
+    std::cout << (double)(clock() - start) / CLOCKS_PER_SEC << " s." << std::endl;
 
     return 0;
 }
